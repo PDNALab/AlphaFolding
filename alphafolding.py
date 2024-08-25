@@ -4,7 +4,7 @@ import Bio.PDB as bp
 from Bio.PDB import *
 import os, re
 from colabdesign import mk_afdesign_model, clear_mem
-from colabdesign.af.alphafold.common import residue_constants
+from colabdesign.af.alphafold.common import protein, residue_constants
 from colabdesign.shared.protein import _np_get_cb
 import pickle
 from colabdesign import af
@@ -21,14 +21,15 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-seq',type=str,default='',help='input sequence')
     parser.add_argument('-recycle',type=int,help='number of recycles')
-    parser.add_argument('-iter',type=int,help='number of iterations in AF')
+    parser.add_argument('-iter',type=int,help='number of iterations')
     parser.add_argument('-seqsep',type=int,default=0,help='sequence separation mask length')
     parser.add_argument('-noise',type=str,default='g',help='noise type gumbel (g) or uniform (u)')
-    parser.add_argument('-nosample_model',action='store_false',default='g',help='noise type gumbel (g) or uniform (u)')
+    parser.add_argument('-sample_model',action='store_true')
     parser.add_argument('-tm_seq',action='store_true',help='sequence separation mask length')
-    parser.add_argument('-seq_n',action='store_true',help='use sequence noise')
-    parser.add_argument('-dgram_n',action='store_true',help='use distogram noise')
+    parser.add_argument('-seq_n',action='store_true',help='use sequence noise or not')
+    parser.add_argument('-dgram_n',action='store_true',help='use distogram noise or not')
     parser.add_argument('-dropout',action='store_true',help='use dropout')
+    parser.add_argument('-temp_mode',type=str,default=None,help='mode of how to feed predicted structure in the next iteration')
     parser.add_argument('-model_name',type=str,default=None,help='model name')  
     parser.add_argument('-template_path',default=None,type=str,help='use template or not')
     return parser.parse_args()
@@ -73,24 +74,17 @@ def xyz_atom37(pdb_file):
     atom37_coord[residue_index-1][atom37_index] = atom.get_coord()
   return atom37_coord
 
-length = 500 
-print(f"run seq {args.seq} with recycle {args.recycle} and dropout {args.dropout}")
 starting_seq = args.seq 
 starting_seq = re.sub("[^A-Z]", "", starting_seq.upper())
-from colabdesign.af.alphafold.common import protein, residue_constants
+length = len(starting_seq)
+print(f"run seq {args.seq} with recycle {args.recycle} and dropout {args.dropout}")
 aa_order = residue_constants.restype_order
 start_seq_aatype=np.array([aa_order[i] for i in starting_seq])
-#3j94: 218-740
-#p = PDBParser()
-#structure = p.get_structure("X", "./iter_0.pdb")
-#[[structure[0]["A"][i+1]["CA"].get_bfactor()]*4 for i in range(len(structure[0]['A']))]
 model_names=None if not args.model_name else [args.model_name]
 use_multimer = False 
-mode = "dgram_retrain" 
+mode = "dgram_retrain" if not args.temp_mode else args.temp_mode
 template_path = args.template_path
 
-if len(starting_seq) > 0:
-  length = len(starting_seq)
 
 if template_path != None:
   template_path = os.path.join(os.getcwd(),template_path)
@@ -127,7 +121,7 @@ use_dropout = args.dropout
 seqsep_mask =  args.seqsep 
 
 #set up AlphaFold 
-sample_models = args.nosample_model 
+sample_models = args.sample_model 
 num_recycles = args.recycle 
 
 L = sum(af_model._lengths)
@@ -151,13 +145,6 @@ af_model._inputs["batch"] = {"aatype":np.zeros(L).astype(int),
                              "all_atom_mask":np.zeros((L,37)),
                              "all_atom_positions":np.zeros((L,37,3)),
                              "dgram":np.zeros((L,L,39))}
-#af_model._inputs["batch"]=af.prep.prep_pdb('3j94_rebuild.pdb')['batch']
-#p = PDBParser()                     
-#structure = p.get_structure("X", "./3j94_rank1.pdb")
-#plddts=np.array([[structure[0]["A"][i+218]["CA"].get_bfactor()]*4 for i in range(len(structure[0]['A']))])
-#
-#af_model._inputs["batch"]['all_atom_mask'][:,:4]=plddts/100
-#af_model._inputs["batch"]["dgram"]=get_dgram(af_model._inputs["batch"]["all_atom_positions"])#pickle.load(open('./3j94_rank1.pkl','rb'))['logits'][218:741,218:741,:],-1)
 if template_path is not None:
   xyz = xyz_atom37(pdb_file=template_path)
   af_model._inputs["batch"]=af.prep.prep_pdb(template_path)['batch']
@@ -176,27 +163,29 @@ if template_path is not None:
     elif dgram_noise_type == 'u':  
       noise = sample_uniform(dgram.shape) * (1 - k/iterations)
       dgram = softmax(np.log(dgram + 1e-8) + noise, -1)
-print(f'use seq, distogram noise: {use_seq_noise, use_dgram_noise, (template_path is not None)}')
-for k in range(iterations):
-  # if k > 0:
-  dgram_xyz = get_dgram(xyz)
-  dgram_prob = softmax(dgram_logits,-1)
 
-  if mode == "xyz":
-    dgram = dgram_xyz
-  if mode == "dgram":
-    dgram = dgram_prob @ dgram_map
-    dgram[...,14:] = dgram_xyz[...,14:] * dgram_prob[...,-1:]
-  if mode == "dgram_retrain":
-    dgram = dgram_prob
-  
-  if use_dgram_noise:
-    if dgram_noise_type == "g":   
-      noise = sample_gumbel(dgram.shape) * (1 - k/iterations)
-      dgram = softmax(np.log(dgram + 1e-8) + noise, -1)
-    elif dgram_noise_type == 'u':  
-      noise = sample_uniform(dgram.shape) * (1 - k/iterations)
-      dgram = softmax(np.log(dgram + 1e-8) + noise, -1)
+#run iterative structure predictions
+print(f'use seq, distogram noise, sample_model, template, mode: {use_seq_noise, use_dgram_noise, sample_models, (template_path is not None), mode}')
+for k in range(iterations):
+  if k > 0:
+    dgram_xyz = get_dgram(xyz)
+    dgram_prob = softmax(dgram_logits,-1)
+
+    if mode == "xyz":
+      dgram = dgram_xyz
+    if mode == "dgram":
+      dgram = dgram_prob @ dgram_map
+      dgram[...,14:] = dgram_xyz[...,14:] * dgram_prob[...,-1:]
+    if mode == "dgram_retrain":
+      dgram = dgram_prob
+    
+    if use_dgram_noise:
+      if dgram_noise_type == "g":   
+        noise = sample_gumbel(dgram.shape) * (1 - k/iterations)
+        dgram = softmax(np.log(dgram + 1e-8) + noise, -1)
+      elif dgram_noise_type == 'u':  
+        noise = sample_uniform(dgram.shape) * (1 - k/iterations)
+        dgram = softmax(np.log(dgram + 1e-8) + noise, -1)
 
     # add mask to avoid local contacts being fixed (otherwise there is a bias toward helix), default is 0 since we'd like to use all structure informaion from last step
     mask = np.abs(offset) > seqsep_mask
